@@ -19,6 +19,7 @@ import {
     updateActiveObservation,
 } from "@langfuse/tracing";
 import {
+    analysisApiResultSchema,
     analysisResultSchema,
     batchRequestSchema,
     csvRowSchema,
@@ -37,11 +38,8 @@ const upload = multer({
 const port = process.env.PORT || 3000;
 const openRouterApiKey = process.env.OPENROUTER_API_KEY?.trim();
 const defaultOpenRouterModel =
-    process.env.OPENROUTER_MODEL?.trim() || "google/gemini-3.1-flash-lite";
-const allowedModels = (
-    process.env.OPENROUTER_MODELS ||
-    [defaultOpenRouterModel, "openai/gpt-4o-mini"].join(",")
-)
+    process.env.OPENROUTER_MODEL?.trim() || "openai/gpt-4o-mini";
+const allowedModels = (process.env.OPENROUTER_MODELS || defaultOpenRouterModel)
     .split(",")
     .map((model) => model.trim())
     .filter(Boolean);
@@ -80,6 +78,95 @@ function resolveModel(requestedModel) {
     return selectedModel;
 }
 
+function buildEmptyPredictedSentimentConfidence() {
+    return {
+        method: "predicted_sentiment_logprobs",
+        matched_text: null,
+        score_percentage: null,
+        average_logprob: null,
+        min_logprob: null,
+        token_count: 0,
+    };
+}
+
+function isLogprobRoutingError(error) {
+    const message = error instanceof Error ? error.message : "";
+    const status =
+        error && typeof error === "object" && "status" in error
+            ? error.status
+            : undefined;
+
+    return (
+        status === 404 &&
+        message.includes(
+            "No endpoints found that can handle the requested parameters",
+        )
+    );
+}
+
+function summarizePredictedSentimentConfidence(
+    rawContent,
+    predictedSentiment,
+    tokenLogprobs,
+) {
+    const emptySummary = buildEmptyPredictedSentimentConfidence();
+    if (!rawContent || !predictedSentiment || !Array.isArray(tokenLogprobs)) {
+        return emptySummary;
+    }
+
+    const valueMatch = /"predicted_sentiment"\s*:\s*"([^"]+)"/.exec(rawContent);
+    if (!valueMatch) {
+        return emptySummary;
+    }
+
+    const matchedText = valueMatch[1];
+    const quotedValue = `"${matchedText}"`;
+    const quotedValueIndex = valueMatch[0].indexOf(quotedValue);
+    if (quotedValueIndex === -1) {
+        return emptySummary;
+    }
+
+    const valueStart = valueMatch.index + quotedValueIndex + 1;
+    const valueEnd = valueStart + matchedText.length;
+    let cursor = 0;
+    const matchedTokens = [];
+
+    for (const tokenEntry of tokenLogprobs) {
+        const token = tokenEntry?.token ?? "";
+        const tokenStart = cursor;
+        const tokenEnd = tokenStart + token.length;
+        cursor = tokenEnd;
+
+        if (tokenEnd > valueStart && tokenStart < valueEnd) {
+            matchedTokens.push(tokenEntry);
+        }
+    }
+
+    if (matchedTokens.length === 0) {
+        return { ...emptySummary, matched_text: matchedText };
+    }
+
+    const averageLogprob =
+        matchedTokens.reduce((sum, token) => sum + token.logprob, 0) /
+        matchedTokens.length;
+    const minLogprob = Math.min(
+        ...matchedTokens.map((token) => token.logprob),
+    );
+    const scorePercentage = Math.max(
+        0,
+        Math.min(100, Math.round(Math.exp(averageLogprob) * 100)),
+    );
+
+    return {
+        method: "predicted_sentiment_logprobs",
+        matched_text: matchedText === predictedSentiment ? matchedText : predictedSentiment,
+        score_percentage: scorePercentage,
+        average_logprob: averageLogprob,
+        min_logprob: minLogprob,
+        token_count: matchedTokens.length,
+    };
+}
+
 // OpenRouter is OpenAI-compatible, so we use the OpenAI SDK pointed at its base
 // URL. Constructed lazily so the server can still boot (and warn) without a key.
 let _openRouterClient = null;
@@ -110,7 +197,11 @@ async function withTrace(name, { tags, ...attributes } = {}, handler) {
     return tags ? propagateAttributes({ tags }, run) : run();
 }
 
-async function analyzeWithOpenRouter(review_text, rating, model) {
+async function analyzeWithOpenRouter(
+    review_text,
+    rating,
+    model,
+) {
     if (!openRouterApiKey) {
         throw new Error(
             "OPENROUTER_API_KEY is missing from .env or not loaded",
@@ -150,16 +241,33 @@ async function analyzeWithOpenRouter(review_text, rating, model) {
           })
         : getOpenRouterClient();
 
-    const completion = await client.chat.completions.create({
+    const request = {
         model: selectedModel,
         messages: prompt,
         temperature: 0,
         response_format: { type: "json_object" },
-        logprobs: true,
-        top_logprobs: 5,
-    });
+    };
 
-    const content = completion?.choices?.[0]?.message?.content;
+    let completion;
+    try {
+        completion = await client.chat.completions.create({
+            ...request,
+            logprobs: true,
+            top_logprobs: 5,
+            provider: {
+                require_parameters: true,
+            },
+        });
+    } catch (error) {
+        if (!isLogprobRoutingError(error)) {
+            throw error;
+        }
+
+        completion = await client.chat.completions.create(request);
+    }
+
+    const choice = completion?.choices?.[0];
+    const content = choice?.message?.content;
     if (!content) {
         throw new Error("OpenRouter returned no content");
     }
@@ -167,7 +275,7 @@ async function analyzeWithOpenRouter(review_text, rating, model) {
     // Per-token logprobs are only emitted by models that support them
     // (e.g. openai/gpt-4o-mini). Unsupported models (e.g. Gemini) return
     // null, so capture into the active Langfuse observation only when present.
-    const logprobs = completion?.choices?.[0]?.logprobs?.content ?? null;
+    const logprobs = choice?.logprobs?.content ?? null;
     if (langfuseEnabled) {
         updateActiveObservation({
             metadata: {
@@ -180,7 +288,17 @@ async function analyzeWithOpenRouter(review_text, rating, model) {
     console.log("OpenRouter response:", content);
 
     const parsed = analysisResultSchema.parse(JSON.parse(content));
-    return parsed;
+    const tokenLogprobs = choice?.logprobs?.content ?? [];
+    const result = {
+        ...parsed,
+        predicted_sentiment_confidence: summarizePredictedSentimentConfidence(
+            content,
+            parsed.predicted_sentiment,
+            tokenLogprobs,
+        ),
+    };
+
+    return analysisApiResultSchema.parse(result);
 }
 
 app.get("/health", (_req, res) => {
@@ -409,7 +527,7 @@ app.post("/scrape", async (req, res) => {
             "Content-Type": "application/json",
             Authorization: `Bearer ${ScraperAppToken}`,
         },
-        body: JSON.stringify({ url, max_rvw: total_reviews }),
+        body: JSON.stringify({ url, total_reviews }),
     });
 
     if (!reviews.ok) {

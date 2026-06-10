@@ -37,6 +37,20 @@ export const analysisResultSchema = z.object({
     confidence_percentage: z.number(),
 });
 
+export const predictedSentimentConfidenceSchema = z.object({
+    method: z.literal("predicted_sentiment_logprobs"),
+    matched_text: z.string().nullable(),
+    score_percentage: z.number().int().min(0).max(100).nullable(),
+    average_logprob: z.number().nullable(),
+    min_logprob: z.number().nullable(),
+    token_count: z.number().int().min(0),
+});
+
+export const analysisApiResultSchema = analysisResultSchema.extend({
+    predicted_sentiment_confidence:
+        predictedSentimentConfidenceSchema.optional(),
+});
+
 export const batchRequestSchema = z.object({
     reviews: z.array(reviewRequestSchema).min(1),
     model: z.string().min(1).optional(),

@@ -21,6 +21,74 @@ const openapiSpec = {
       description: "Single, batch, and CSV-based analysis"
     }
   ],
+  components: {
+    schemas: {
+      PredictedSentimentConfidence: {
+        type: "object",
+        properties: {
+          method: {
+            type: "string",
+            example: "predicted_sentiment_logprobs"
+          },
+          matched_text: {
+            type: "string",
+            nullable: true,
+            example: "Positive"
+          },
+          score_percentage: {
+            type: "integer",
+            nullable: true,
+            minimum: 0,
+            maximum: 100,
+            example: 92
+          },
+          average_logprob: {
+            type: "number",
+            nullable: true,
+            example: -0.08
+          },
+          min_logprob: {
+            type: "number",
+            nullable: true,
+            example: -0.19
+          },
+          token_count: {
+            type: "integer",
+            minimum: 0,
+            example: 2
+          }
+        },
+        required: ["method", "matched_text", "score_percentage", "average_logprob", "min_logprob", "token_count"]
+      },
+      AnalysisResult: {
+        type: "object",
+        properties: {
+          predicted_sentiment: {
+            type: "string",
+            enum: ["Positive", "Neutral", "Irrelevant", "Sarcastic Negative", "Genuine Negative"]
+          },
+          rating_sentiment: {
+            type: "string",
+            enum: ["Positive", "Neutral", "Irrelevant", "Sarcastic Negative", "Genuine Negative"]
+          },
+          is_consistent: { type: "boolean" },
+          explanation: { type: "string" },
+          confidence_percentage: { type: "number" },
+          predicted_sentiment_confidence: {
+            $ref: "#/components/schemas/PredictedSentimentConfidence"
+          }
+        },
+        required: [
+          "predicted_sentiment",
+          "rating_sentiment",
+          "is_consistent",
+          "explanation",
+          "confidence_percentage",
+          "predicted_sentiment_confidence"
+        ]
+      }
+    }
+  },
   paths: {
     "/health": {
       get: {
@@ -108,7 +176,14 @@ const openapiSpec = {
         },
         responses: {
           200: {
-            description: "Analysis result"
+            description: "Analysis result",
+            content: {
+              "application/json": {
+                schema: {
+                  $ref: "#/components/schemas/AnalysisResult"
+                }
+              }
+            }
           }
         }
       }
@@ -153,7 +228,17 @@ const openapiSpec = {
         },
         responses: {
           200: {
-            description: "Array of analysis results"
+            description: "Array of analysis results",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "array",
+                  items: {
+                    $ref: "#/components/schemas/AnalysisResult"
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -186,7 +271,24 @@ const openapiSpec = {
         },
         responses: {
           200: {
-            description: "Bulk analysis result"
+            description: "Bulk analysis result",
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    total_rows: { type: "integer" },
+                    results: {
+                      type: "array",
+                      items: {
+                        $ref: "#/components/schemas/AnalysisResult"
+                      }
+                    }
+                  },
+                  required: ["total_rows", "results"]
+                }
+              }
+            }
           }
         }
       }
