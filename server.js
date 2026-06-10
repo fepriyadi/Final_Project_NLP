@@ -13,7 +13,11 @@ import { parse } from "csv-parse/sync";
 import swaggerUi from "swagger-ui-express";
 import OpenAI from "openai";
 import { observeOpenAI } from "@langfuse/openai";
-import { startActiveObservation, propagateAttributes } from "@langfuse/tracing";
+import {
+    startActiveObservation,
+    propagateAttributes,
+    updateActiveObservation,
+} from "@langfuse/tracing";
 import {
     analysisResultSchema,
     batchRequestSchema,
@@ -34,7 +38,10 @@ const port = process.env.PORT || 3000;
 const openRouterApiKey = process.env.OPENROUTER_API_KEY?.trim();
 const defaultOpenRouterModel =
     process.env.OPENROUTER_MODEL?.trim() || "google/gemini-3.1-flash-lite";
-const allowedModels = (process.env.OPENROUTER_MODELS || defaultOpenRouterModel)
+const allowedModels = (
+    process.env.OPENROUTER_MODELS ||
+    [defaultOpenRouterModel, "openai/gpt-4o-mini"].join(",")
+)
     .split(",")
     .map((model) => model.trim())
     .filter(Boolean);
@@ -148,11 +155,26 @@ async function analyzeWithOpenRouter(review_text, rating, model) {
         messages: prompt,
         temperature: 0,
         response_format: { type: "json_object" },
+        logprobs: true,
+        top_logprobs: 5,
     });
 
     const content = completion?.choices?.[0]?.message?.content;
     if (!content) {
         throw new Error("OpenRouter returned no content");
+    }
+
+    // Per-token logprobs are only emitted by models that support them
+    // (e.g. openai/gpt-4o-mini). Unsupported models (e.g. Gemini) return
+    // null, so capture into the active Langfuse observation only when present.
+    const logprobs = completion?.choices?.[0]?.logprobs?.content ?? null;
+    if (langfuseEnabled) {
+        updateActiveObservation({
+            metadata: {
+                logprobs_supported: logprobs !== null,
+                logprobs,
+            },
+        });
     }
 
     console.log("OpenRouter response:", content);
